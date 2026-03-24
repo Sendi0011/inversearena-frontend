@@ -6,8 +6,8 @@ use std::vec::Vec;
 use super::*;
 use proptest::prelude::*;
 use soroban_sdk::{
-    testutils::{Address as _, Ledger as _, LedgerInfo},
     Address, BytesN, Env,
+    testutils::{Address as _, Ledger as _, LedgerInfo},
 };
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -155,6 +155,7 @@ fn start_round_records_start_and_deadline_ledgers() {
             active: true,
             total_submissions: 0,
             timed_out: false,
+            finished: false,
         }
     );
 }
@@ -1091,6 +1092,95 @@ fn partial_submissions_preserved_after_timeout() {
     assert_eq!(client.get_choice(&1, &player_c), None); // absent
 }
 
+// ── Claim and Payout tests ────────────────────────────────────────────────────
+
+use soroban_sdk::token::Client as TokenClient;
+use soroban_sdk::token::StellarAssetClient;
+
+fn setup_token(env: &Env, admin: &Address) -> (TokenClient<'static>, Address) {
+    let contract_id = env.register_stellar_asset_contract(admin.clone());
+    let token = TokenClient::new(env, &contract_id);
+    let asset = StellarAssetClient::new(env, &contract_id);
+    (token, contract_id)
+}
+
+#[test]
+fn claim_success_winner_receives_balance() {
+    let (env, admin, client) = setup_with_admin();
+
+    // Set up Token
+    let (token, token_id) = setup_token(&env, &admin);
+    let asset = StellarAssetClient::new(&env, &token_id);
+
+    // Mint tokens to the arena contract
+    let arena_addr = client.address.clone();
+    asset.mint(&arena_addr, &1000);
+
+    client.set_token(&token_id);
+
+    let player = Address::generate(&env);
+    client.init(&5);
+    client.start_round();
+
+    // Admin sets winner (stake=100, yield=25)
+    env.mock_all_auths();
+    client.set_winner(&player, &100, &25);
+
+    // Player claims
+    client.claim(&player);
+
+    // Winner receives correct token balance (stake + yield)
+    assert_eq!(token.balance(&player), 125);
+
+    // Remaining balance in arena
+    assert_eq!(token.balance(&arena_addr), 1000 - 125);
+
+    // Game status set to Finished after claim
+    let round = client.get_round();
+    assert!(round.finished);
+}
+
+#[test]
+fn claim_reverts_for_non_winner() {
+    let (env, admin, client) = setup_with_admin();
+    let (token, token_id) = setup_token(&env, &admin);
+    let asset = StellarAssetClient::new(&env, &token_id);
+    asset.mint(&client.address, &1000);
+    client.set_token(&token_id);
+    client.init(&5);
+    client.start_round();
+
+    let non_winner = Address::generate(&env);
+
+    env.mock_all_auths();
+    let res = client.try_claim(&non_winner);
+    assert_eq!(res, Err(Ok(ArenaError::NoPrizeToClaim)));
+}
+
+#[test]
+fn double_claim_reverts() {
+    let (env, admin, client) = setup_with_admin();
+    let (token, token_id) = setup_token(&env, &admin);
+    let asset = StellarAssetClient::new(&env, &token_id);
+    asset.mint(&client.address, &1000);
+    client.set_token(&token_id);
+    client.init(&5);
+    client.start_round();
+
+    let player = Address::generate(&env);
+
+    env.mock_all_auths();
+    client.set_winner(&player, &100, &10);
+
+    // First claim succeeds
+    client.claim(&player);
+    assert_eq!(token.balance(&player), 110);
+
+    // Second claim reverts
+    let res = client.try_claim(&player);
+    assert_eq!(res, Err(Ok(ArenaError::AlreadyClaimed)));
+}
+
 // ── Pause mechanism tests ───────────────────────────────────────────────────
 
 #[test]
@@ -1152,187 +1242,174 @@ fn test_unpause_restores_functionality() {
     assert_eq!(round.round_number, 1);
 }
 
-// ── claim() tests ──────────────────────────────────────────────────────────────
+// ── Issue #271: Emergency Pause Policy — governance/upgrade exemption ──────────
+//
+// Policy: propose_upgrade, execute_upgrade, and cancel_upgrade must be callable
+// by ADMIN even when the contract is paused, so that a recovery upgrade can
+// always be initiated without first unpausing.
 
-/// Shared setup: initialised arena + SAC token + one registered player.
-/// Returns (env, arena_client, player, token_id, stake).
-fn setup_claim_env() -> (
-    Env,
-    ArenaContractClient<'static>,
-    Address,
-    Address,
-    i128,
-) {
-    let env = Env::default();
-    env.mock_all_auths();
-    set_ledger(&env, 0);
+/// When paused, propose_upgrade still succeeds for the admin.
+#[test]
+fn test_propose_upgrade_succeeds_when_paused() {
+    let (env, _admin, client) = setup_with_admin();
+    let hash = dummy_hash(&env);
 
-    let contract_id = env.register(ArenaContract, ());
-    // SAFETY: env outlives the client within each test.
-    let env_s: &'static Env = unsafe { &*(&env as *const Env) };
-    let client = ArenaContractClient::new(env_s, &contract_id);
+    client.pause();
+    assert!(client.is_paused(), "contract must be paused for this test");
 
-    let admin = Address::generate(&env);
-    client.initialize(&admin);
-    client.init(&10u32);
+    // Must NOT panic or return Paused error — governance is exempt.
+    client.propose_upgrade(&hash);
 
-    // Register a SAC token and mint stake to the player.
-    let token_admin = Address::generate(&env);
-    let token_id = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
-    let stake: i128 = 100_000_000;
+    let pending = client.pending_upgrade();
+    assert!(pending.is_some(), "proposal must be stored even when contract is paused");
+    assert_eq!(pending.unwrap().0, hash);
+}
 
+/// When paused, cancel_upgrade still succeeds for the admin.
+#[test]
+fn test_cancel_upgrade_succeeds_when_paused() {
+    let (env, _admin, client) = setup_with_admin();
+    let hash = dummy_hash(&env);
+
+    // Propose first, then pause.
+    client.propose_upgrade(&hash);
+    client.pause();
+    assert!(client.is_paused());
+
+    // Cancel must succeed even while paused.
+    client.cancel_upgrade();
+
+    assert!(
+        client.pending_upgrade().is_none(),
+        "proposal must be cleared even when contract is paused"
+    );
+}
+
+/// When paused, cancel_upgrade can be called after a proposal made while paused.
+#[test]
+fn test_cancel_upgrade_after_paused_propose() {
+    let (env, _admin, client) = setup_with_admin();
+    let hash = dummy_hash(&env);
+
+    client.pause();
+    assert!(client.is_paused());
+
+    // Propose while paused — must succeed.
+    client.propose_upgrade(&hash);
+    assert!(client.pending_upgrade().is_some());
+
+    // Cancel while still paused — must also succeed.
+    client.cancel_upgrade();
+    assert!(client.pending_upgrade().is_none());
+}
+
+/// When paused, normal game functions are blocked but governance functions are not.
+/// This is the core invariant of the Emergency Pause Policy.
+#[test]
+fn test_paused_blocks_game_functions_not_governance() {
+    let (env, _admin, client) = setup_with_admin();
     let player = Address::generate(&env);
-    soroban_sdk::token::StellarAssetClient::new(&env, &token_id).mint(&player, &stake);
+    let hash = dummy_hash(&env);
 
-    // Also mint into the contract itself so it can pay out (simulates accumulated pool).
-    // In a real game join() does this; here we test claim() in isolation first.
-    soroban_sdk::token::StellarAssetClient::new(&env, &token_id)
-        .mint(&contract_id, &stake);
+    client.init(&10);
+    client.pause();
+    assert!(client.is_paused());
 
-    client.set_token(&token_id);
-
-    (env, client, player, token_id, stake)
-}
-
-// AC: Only last survivor can claim — happy path
-#[test]
-fn claim_succeeds_for_sole_survivor() {
-    let (env, client, player, token_id, stake) = setup_claim_env();
-
-    // Player joins (token already minted to player in setup).
-    client.join(&player, &stake);
-    // survivor_count is now 1; prize_pool == stake; contract token balance == 2*stake
-    // (setup minted directly to contract + join() transferred stake again).
-    // Reset: use a fresh stake that came purely from join() by adjusting expectations.
-
-    let prize = client.try_claim(&player).expect("claim must succeed").unwrap();
-    assert_eq!(prize, stake, "winner must receive the full prize pool");
-
-    // Token balance of winner must have increased by prize.
-    let balance = soroban_sdk::token::TokenClient::new(&env, &token_id).balance(&player);
-    // Player started with `stake`, transferred it in on join(), received prize back.
-    assert_eq!(balance, stake, "winner token balance must equal the prize");
-}
-
-// AC: Game marked as Finished after claim — double-claim rejected
-#[test]
-fn claim_marks_game_as_finished() {
-    let (_env, client, player, _token_id, stake) = setup_claim_env();
-
-    client.join(&player, &stake);
-    client.claim(&player);
-
-    let result = client.try_claim(&player);
+    // Game functions MUST be blocked when paused.
     assert_eq!(
-        result,
-        Err(Ok(ArenaError::GameAlreadyFinished)),
-        "second claim must be rejected with GameAlreadyFinished"
+        client.try_start_round(),
+        Err(Ok(ArenaError::Paused)),
+        "start_round must fail when paused"
+    );
+    assert_eq!(
+        client.try_timeout_round(),
+        Err(Ok(ArenaError::Paused)),
+        "timeout_round must fail when paused"
+    );
+    assert_eq!(
+        client.try_submit_choice(&player, &Choice::Heads),
+        Err(Ok(ArenaError::Paused)),
+        "submit_choice must fail when paused"
+    );
+
+    // Governance functions MUST succeed even when paused.
+    client.propose_upgrade(&hash);
+    assert!(
+        client.pending_upgrade().is_some(),
+        "propose_upgrade must succeed when paused"
+    );
+
+    client.cancel_upgrade();
+    assert!(
+        client.pending_upgrade().is_none(),
+        "cancel_upgrade must succeed when paused"
     );
 }
 
-// AC: Non-survivor cannot claim
+/// After unpausing, all functions — game and governance — work normally.
 #[test]
-fn claim_rejected_if_not_a_survivor() {
-    let (env, client, player, _token_id, stake) = setup_claim_env();
+fn test_all_functions_work_after_unpause() {
+    let (env, _admin, client) = setup_with_admin();
+    let hash = dummy_hash(&env);
 
-    client.join(&player, &stake);
+    client.init(&10);
+    client.pause();
+    client.unpause();
+    assert!(!client.is_paused());
 
-    let outsider = Address::generate(&env);
-    let result = client.try_claim(&outsider);
-    assert_eq!(
-        result,
-        Err(Ok(ArenaError::NotASurvivor)),
-        "non-survivor must be rejected"
-    );
+    // Game functions must work again.
+    let round = client.start_round();
+    assert_eq!(round.round_number, 1);
+    assert!(round.active);
+
+    // Governance functions must also still work unpaused.
+    client.propose_upgrade(&hash);
+    assert!(client.pending_upgrade().is_some());
+
+    client.cancel_upgrade();
+    assert!(client.pending_upgrade().is_none());
 }
 
-// AC: Claim rejected when no prize pool
+/// Propose while paused, then unpause and verify the proposal persists so
+/// execute_upgrade can be called after the timelock elapses.
 #[test]
-fn claim_rejected_if_no_prize() {
-    let (env, client, _player, token_id, _stake) = setup_claim_env();
+fn test_paused_proposal_persists_after_unpause() {
+    let (env, _admin, client) = setup_with_admin();
+    let hash = dummy_hash(&env);
 
-    // Register a player directly without going through join() so the pool stays at 0.
-    // We do this by manipulating survivor_count expectation: use a fresh env where
-    // no one has joined (pool = 0, survivor_count = 0).
-    // Simplest: add a survivor manually via join with 0 amount is blocked, so
-    // instead test claim on a fresh contract with manually-forced count of 1 but no pool.
-    // The cleanest approach: join a player (pool = stake), drain pool via second join?
-    // Actually: pool stays positive after one join. Test pool=0 via a contract with
-    // survivor_count=1 but PRIZE_POOL_KEY never populated — not reachable through normal flow.
-    // Instead, verify the error surfaces when count != 1 (covers the NoPrizeToClaim path).
-    // We rely on `claim_rejected_if_survivor_count_not_one` for the count branch and this
-    // test validates the pool=0 guard by checking count=0 triggers NoPrizeToClaim.
-    let solo = Address::generate(&env);
-    soroban_sdk::token::StellarAssetClient::new(&env, &token_id).mint(&solo, &1_000_000i128);
+    client.pause();
+    client.propose_upgrade(&hash);
 
-    // Only one survivor but pool is 0 because solo never joined.
-    // Trick: join solo (pool fills), then check that count=1 and prize>0 works normally.
-    // For pool=0 path: no-one joins, count=0 → NoPrizeToClaim (count branch fires first).
-    let result = client.try_claim(&solo);
-    assert_eq!(
-        result,
-        Err(Ok(ArenaError::NoPrizeToClaim)),
-        "claim with zero survivors must return NoPrizeToClaim"
-    );
+    let pending_paused = client.pending_upgrade().expect("proposal must exist while paused");
+    assert_eq!(pending_paused.0, hash);
+
+    // Unpause — proposal must survive.
+    client.unpause();
+    assert!(!client.is_paused());
+
+    let pending_unpaused = client.pending_upgrade().expect("proposal must persist after unpause");
+    assert_eq!(pending_unpaused.0, hash);
+    assert_eq!(pending_paused.1, pending_unpaused.1, "execute_after timestamp must be unchanged");
 }
 
-// AC: Claim blocked when multiple survivors remain
+/// is_paused() view function reflects pause/unpause state transitions correctly.
 #[test]
-fn claim_rejected_if_survivor_count_not_one() {
-    let (env, client, player, token_id, stake) = setup_claim_env();
+fn test_is_paused_reflects_state_transitions() {
+    let (_env, _admin, client) = setup_with_admin();
 
-    let player2 = Address::generate(&env);
-    soroban_sdk::token::StellarAssetClient::new(&env, &token_id).mint(&player2, &stake);
+    assert!(!client.is_paused(), "contract starts unpaused");
 
-    client.join(&player, &stake);
-    client.join(&player2, &stake);
-    assert_eq!(client.survivor_count(), 2);
+    client.pause();
+    assert!(client.is_paused(), "must be paused after pause()");
 
-    let result = client.try_claim(&player);
-    assert_eq!(
-        result,
-        Err(Ok(ArenaError::NoPrizeToClaim)),
-        "claim with 2 survivors must return NoPrizeToClaim"
-    );
-}
+    client.unpause();
+    assert!(!client.is_paused(), "must be unpaused after unpause()");
 
-// AC: join() correctly increments survivor_count
-#[test]
-fn join_increments_survivor_count() {
-    let (env, client, p1, token_id, stake) = setup_claim_env();
+    // Toggle multiple times — state must always match the last call.
+    client.pause();
+    client.pause(); // idempotent
+    assert!(client.is_paused());
 
-    assert_eq!(client.survivor_count(), 0);
-
-    client.join(&p1, &stake);
-    assert_eq!(client.survivor_count(), 1);
-
-    let p2 = Address::generate(&env);
-    soroban_sdk::token::StellarAssetClient::new(&env, &token_id).mint(&p2, &stake);
-    client.join(&p2, &stake);
-    assert_eq!(client.survivor_count(), 2);
-
-    let p3 = Address::generate(&env);
-    soroban_sdk::token::StellarAssetClient::new(&env, &token_id).mint(&p3, &stake);
-    client.join(&p3, &stake);
-    assert_eq!(client.survivor_count(), 3);
-}
-
-// AC: GameEnded event emitted on successful claim
-#[test]
-fn claim_emits_game_ended_event() {
-    use soroban_sdk::testutils::Events;
-
-    let (_env, client, player, _token_id, stake) = setup_claim_env();
-
-    client.join(&player, &stake);
-    client.claim(&player);
-
-    // The last event must be the GameEnded publish.
-    let events = _env.events().all();
-    assert!(!events.is_empty(), "at least one event must have been emitted");
-    // The GameEnded event topic is ("G_END",).
-    let last = events.last().expect("events must not be empty");
-    // topic vec contains the symbol; just verify the event list is non-empty and
-    // no panic occurred — full topic shape verified by integration coverage.
-    let _ = last;
+    client.unpause();
+    assert!(!client.is_paused());
 }
