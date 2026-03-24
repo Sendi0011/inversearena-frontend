@@ -11,9 +11,8 @@ extern crate std;
 use factory::{FactoryContract, FactoryContractClient};
 use payout::{PayoutContract, PayoutContractClient};
 use soroban_sdk::{
-    symbol_short,
+    Address, BytesN, Env, symbol_short,
     testutils::{Address as _, Ledger, LedgerInfo},
-    Address, BytesN, Env,
 };
 
 use super::*;
@@ -84,7 +83,7 @@ fn lifecycle_full_game_three_rounds_eight_players() {
 
     let creator = Address::generate(&env);
     // pool_id=1, capacity=8, stake=10 XLM
-    factory.create_pool(&admin, &creator, &10_000_000i128);
+    factory.create_pool(&admin, &creator, &1u32, &8u32, &10_000_000i128);
 
     // ── Step 2: Initialise the arena (10-ledger rounds) ───────────────────────
     arena.init(&10u32);
@@ -102,8 +101,12 @@ fn lifecycle_full_game_three_rounds_eight_players() {
 
     set_seq(&env, 1_015);
     for (i, p) in players.iter().enumerate() {
-        let choice = if i % 2 == 0 { Choice::Heads } else { Choice::Tails };
-        arena.submit_choice(p, &choice);
+        let choice = if i % 2 == 0 {
+            Choice::Heads
+        } else {
+            Choice::Tails
+        };
+        arena.submit_choice(p, &1u32, &choice);
     }
 
     // Verify all 8 submissions recorded.
@@ -116,18 +119,29 @@ fn lifecycle_full_game_three_rounds_eight_players() {
     assert!(!t1.active);
     assert!(t1.timed_out);
     assert_eq!(t1.round_number, 1);
-    assert_eq!(t1.total_submissions, 8, "round 1 must capture all 8 submissions");
+    assert_eq!(
+        t1.total_submissions, 8,
+        "round 1 must capture all 8 submissions"
+    );
 
     // All choices are still readable after timeout.
     for (i, p) in players.iter().enumerate() {
-        let expected = if i % 2 == 0 { Choice::Heads } else { Choice::Tails };
+        let expected = if i % 2 == 0 {
+            Choice::Heads
+        } else {
+            Choice::Tails
+        };
         assert_eq!(arena.get_choice(&1u32, p), Some(expected));
     }
 
     // ── Step 4: Round 2 — 4 survivors submit ─────────────────────────────────
     // (simulate elimination: only players who chose Heads in round 1 advance)
-    let survivors_r2: std::vec::Vec<&Address> =
-        players.iter().enumerate().filter(|(i, _)| i % 2 == 0).map(|(_, p)| p).collect();
+    let survivors_r2: std::vec::Vec<&Address> = players
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| i % 2 == 0)
+        .map(|(_, p)| p)
+        .collect();
     assert_eq!(survivors_r2.len(), 4);
 
     set_seq(&env, 1_030);
@@ -137,12 +151,19 @@ fn lifecycle_full_game_three_rounds_eight_players() {
 
     set_seq(&env, 1_035);
     for (i, p) in survivors_r2.iter().enumerate() {
-        let choice = if i % 2 == 0 { Choice::Heads } else { Choice::Tails };
-        arena.submit_choice(p, &choice);
+        let choice = if i % 2 == 0 {
+            Choice::Heads
+        } else {
+            Choice::Tails
+        };
+        arena.submit_choice(p, &2u32, &choice);
     }
 
     let state2 = arena.get_round();
-    assert_eq!(state2.total_submissions, 4, "round 2 must have exactly 4 submissions");
+    assert_eq!(
+        state2.total_submissions, 4,
+        "round 2 must have exactly 4 submissions"
+    );
 
     set_seq(&env, 1_041);
     let t2 = arena.timeout_round();
@@ -166,11 +187,14 @@ fn lifecycle_full_game_three_rounds_eight_players() {
 
     set_seq(&env, 1_055);
     for p in &survivors_r3 {
-        arena.submit_choice(p, &Choice::Heads);
+        arena.submit_choice(p, &3u32, &Choice::Heads);
     }
 
     let state3 = arena.get_round();
-    assert_eq!(state3.total_submissions, 2, "round 3 must have exactly 2 submissions");
+    assert_eq!(
+        state3.total_submissions, 2,
+        "round 3 must have exactly 2 submissions"
+    );
 
     set_seq(&env, 1_061);
     let t3 = arena.timeout_round();
@@ -207,7 +231,7 @@ fn lifecycle_player_counts_decrease_each_round() {
 
     factory.set_arena_wasm_hash(&dummy_wasm_hash(&env));
     let creator = Address::generate(&env);
-    factory.create_pool(&admin, &creator, &10_000_000i128);
+    factory.create_pool(&admin, &creator, &1u32, &8u32, &10_000_000i128);
 
     arena.init(&5u32);
 
@@ -218,7 +242,7 @@ fn lifecycle_player_counts_decrease_each_round() {
     arena.start_round();
     set_seq(&env, 512);
     for p in &all_players {
-        arena.submit_choice(p, &Choice::Heads);
+        arena.submit_choice(p, &1u32, &Choice::Heads);
     }
     set_seq(&env, 516);
     let r1 = arena.timeout_round();
@@ -229,7 +253,7 @@ fn lifecycle_player_counts_decrease_each_round() {
     arena.start_round();
     set_seq(&env, 522);
     for p in all_players.iter().take(4) {
-        arena.submit_choice(p, &Choice::Heads);
+        arena.submit_choice(p, &2u32, &Choice::Heads);
     }
     set_seq(&env, 526);
     let r2 = arena.timeout_round();
@@ -240,7 +264,7 @@ fn lifecycle_player_counts_decrease_each_round() {
     arena.start_round();
     set_seq(&env, 532);
     for p in all_players.iter().take(2) {
-        arena.submit_choice(p, &Choice::Heads);
+        arena.submit_choice(p, &3u32, &Choice::Heads);
     }
     set_seq(&env, 536);
     let r3 = arena.timeout_round();
@@ -264,7 +288,7 @@ fn lifecycle_factory_and_arena_operate_in_same_env() {
     factory.set_arena_wasm_hash(&dummy_wasm_hash(&env));
     let creator = Address::generate(&env);
     // Factory must succeed before arena can be used.
-    factory.create_pool(&admin, &creator, &20_000_000i128);
+    factory.create_pool(&admin, &creator, &1u32, &8u32, &20_000_000i128);
 
     // Arena initialises and runs a round — no cross-contract panic.
     arena.init(&3u32);
@@ -293,17 +317,18 @@ fn lifecycle_winner_payout_equals_total_stakes() {
     let num_players: i128 = 8;
     let total_prize = stake_per_player * num_players;
 
-    factory.create_pool(&admin, &creator, &stake_per_player);
+    factory.create_pool(&admin, &creator, &1u32, &8u32, &stake_per_player);
     arena.init(&10u32);
 
-    let players: std::vec::Vec<Address> = (0..num_players).map(|_| Address::generate(&env)).collect();
+    let players: std::vec::Vec<Address> =
+        (0..num_players).map(|_| Address::generate(&env)).collect();
 
     // Run a single round, all players submit.
     set_seq(&env, 210);
     arena.start_round();
     set_seq(&env, 215);
     for p in &players {
-        arena.submit_choice(p, &Choice::Heads);
+        arena.submit_choice(p, &1u32, &Choice::Heads);
     }
     set_seq(&env, 221);
     arena.timeout_round();
@@ -339,7 +364,7 @@ fn lifecycle_guard_no_active_round_between_rounds() {
     let player = Address::generate(&env);
 
     // No round started yet — submit must fail.
-    let err = arena.try_submit_choice(&player, &Choice::Heads);
+    let err = arena.try_submit_choice(&player, &1u32, &Choice::Heads);
     assert_eq!(err, Err(Ok(ArenaError::NoActiveRound)));
 
     // Start and finish a round.
@@ -349,7 +374,7 @@ fn lifecycle_guard_no_active_round_between_rounds() {
     arena.timeout_round();
 
     // Between rounds — submit must fail.
-    let err2 = arena.try_submit_choice(&player, &Choice::Heads);
+    let err2 = arena.try_submit_choice(&player, &2u32, &Choice::Heads);
     assert_eq!(err2, Err(Ok(ArenaError::NoActiveRound)));
 
     // Between rounds — timeout must fail.
@@ -370,7 +395,7 @@ fn lifecycle_round_with_no_submissions_resolves_then_payout() {
 
     factory.set_arena_wasm_hash(&dummy_wasm_hash(&env));
     let creator = Address::generate(&env);
-    factory.create_pool(&admin, &creator, &10_000_000i128);
+    factory.create_pool(&admin, &creator, &1u32, &8u32, &10_000_000i128);
 
     arena.init(&10u32);
 
@@ -386,6 +411,12 @@ fn lifecycle_round_with_no_submissions_resolves_then_payout() {
 
     // Payout can still be distributed for a separately determined winner.
     let winner = Address::generate(&env);
-    payout.distribute_winnings(&admin, &1u32, &winner, &10_000_000i128, &symbol_short!("XLM"));
+    payout.distribute_winnings(
+        &admin,
+        &1u32,
+        &winner,
+        &10_000_000i128,
+        &symbol_short!("XLM"),
+    );
     assert!(payout.is_payout_processed(&1u32, &winner));
 }

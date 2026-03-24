@@ -1,7 +1,7 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, Symbol,
+    Address, BytesN, Env, Symbol, contract, contractimpl, contracttype, symbol_short,
 };
 
 // ── Storage keys ─────────────────────────────────────────────────────────────
@@ -240,9 +240,10 @@ impl FactoryContract {
 
         env.storage().instance().set(&pool_key, &true);
 
-        env.events()
-            .publish((TOPIC_POOL_CREATED,), (pool_id, creator, capacity, stake_amount));
->>>>>>> upstream/main
+        env.events().publish(
+            (TOPIC_POOL_CREATED,),
+            (pool_id, creator, capacity, stake_amount),
+        );
     }
 
     // ── Upgrade mechanism ────────────────────────────────────────────────────
