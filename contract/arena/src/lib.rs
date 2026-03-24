@@ -47,9 +47,12 @@ pub enum ArenaError {
     RoundDeadlineOverflow = 8,
     NotInitialized = 9,
     Paused = 10,
-    NoPrizeToClaim = 11,
-    AlreadyClaimed = 12,
-    ReentrancyGuard = 13,
+    ArenaFull = 11,
+    AlreadyJoined = 12,
+    InvalidAmount = 13,
+    NoPrizeToClaim = 14,
+    AlreadyClaimed = 15,
+    ReentrancyGuard = 16,
 }
 
 #[contracttype]
@@ -82,6 +85,7 @@ enum DataKey {
     Config,
     Round,
     Submission(u32, Address),
+    Survivor(Address),
     PrizeClaimed(Address),
 }
 
@@ -211,6 +215,24 @@ impl ArenaContract {
     /// Return whether the contract is paused.
     pub fn is_paused(env: Env) -> bool {
         env.storage().instance().get(&PAUSED_KEY).unwrap_or(false)
+    }
+
+    pub fn join(env: Env, player: Address, amount: i128) -> Result<(), ArenaError> {
+        player.require_auth();
+
+        if amount <= 0 {
+            return Err(ArenaError::InvalidAmount);
+        }
+
+        let survivor_key = DataKey::Survivor(player.clone());
+        if storage(&env).has(&survivor_key) {
+            return Err(ArenaError::AlreadyJoined);
+        }
+
+        storage(&env).set(&survivor_key, &());
+        bump(&env, &survivor_key);
+
+        Ok(())
     }
 
     // ── Round state machine ──────────────────────────────────────────────────
