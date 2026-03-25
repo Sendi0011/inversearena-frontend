@@ -97,6 +97,8 @@ impl PayoutContract {
             panic_with_error!(&env, PayoutError::UnauthorizedCaller);
         }
 
+        caller.require_auth();
+
         if amount <= 0 {
             panic_with_error!(&env, PayoutError::InvalidAmount);
         }
