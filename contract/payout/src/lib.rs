@@ -1,7 +1,7 @@
 #![no_std]
 
 use soroban_sdk::{
-    Address, BytesN, Env, Symbol, Vec, contract, contracterror, contractimpl, contracttype,
+    Address, BytesN, Env, IntoVal, Symbol, Vec, contract, contracterror, contractimpl, contracttype,
     panic_with_error, symbol_short, token,
 };
 
@@ -19,6 +19,8 @@ const TOPIC_UPGRADE_PROPOSED: Symbol = symbol_short!("UP_PROP");
 const TOPIC_UPGRADE_EXECUTED: Symbol = symbol_short!("UP_EXEC");
 const TOPIC_UPGRADE_CANCELLED: Symbol = symbol_short!("UP_CANC");
 
+const FACTORY_KEY: Symbol = symbol_short!("FACTORY");
+
 const TIMELOCK_PERIOD: u64 = 48 * 60 * 60;
 const EVENT_VERSION: u32 = 1;
 
@@ -29,11 +31,30 @@ const INSTANCE_TTL_THRESHOLD: u32 = 100_000;
 const INSTANCE_TTL_EXTEND_TO: u32 = 535_680;
 
 #[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ArenaStatus {
+    Pending,
+    Active,
+    Completed,
+    Cancelled,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ArenaRef {
+    pub contract: Address,
+    pub status: ArenaStatus,
+    pub host: Address,
+}
+
+#[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
     CurrencyToken(Symbol),
     Payout(Symbol, u32, u32, Address),
     PrizePayout(u32),
+    SplitPayout(u32, Address),
+    SplitPayoutBatch(u32),
     PayoutHistory(u64),
     ArenaPayout(u64),
 }
@@ -45,6 +66,15 @@ pub struct PayoutData {
     pub amount: i128,
     pub currency: Symbol,
     pub paid: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SplitPayoutReceipt {
+    pub arena_id: u32,
+    pub winner: Address,
+    pub amount: i128,
+    pub currency: Address,
 }
 
 #[contracttype]
@@ -94,24 +124,16 @@ impl PayoutContract {
         789
     }
 
-    pub fn initialize(env: Env, admin: Address) {
-        if env.storage().instance().has(&ADMIN_KEY) {
-            panic!("already initialized");
-        }
-
+    pub fn __constructor(env: Env, admin: Address) {
         admin.require_auth();
-
         env.storage().instance().set(&ADMIN_KEY, &admin);
     }
 
-    pub fn init_factory(env: Env, factory: Address, admin: Address) {
-        if env.storage().instance().has(&ADMIN_KEY) {
-            panic!("already initialized");
-        }
+    pub fn init_factory(env: Env, factory: Address) {
+        let admin = Self::admin(env.clone());
+        admin.require_auth();
 
-        factory.require_auth();
-
-        env.storage().instance().set(&ADMIN_KEY, &admin);
+        env.storage().instance().set(&FACTORY_KEY, &factory);
     }
 
     pub fn admin(env: Env) -> Address {
@@ -167,6 +189,7 @@ impl PayoutContract {
     /// * `AlreadyPaid`        — the composite key was already processed.
     pub fn distribute_winnings(
         env: Env,
+        caller: Address,
         ctx: Symbol,
         pool_id: u32,
         round_id: u32,
@@ -174,13 +197,24 @@ impl PayoutContract {
         amount: i128,
         currency: Symbol,
     ) -> Result<(), PayoutError> {
-        let admin: Address = env
+        caller.require_auth();
+
+        let factory: Address = env
             .storage()
             .instance()
-            .get(&ADMIN_KEY)
-            .expect("not initialized");
+            .get(&FACTORY_KEY)
+            .expect("factory not initialized");
 
-        admin.require_auth();
+        let arena_id = pool_id as u64;
+        let arena_ref: ArenaRef = env.invoke_contract(
+            &factory,
+            &soroban_sdk::Symbol::new(&env, "get_arena_ref"),
+            soroban_sdk::vec![&env, arena_id.into_val(&env)],
+        );
+
+        if caller != arena_ref.contract {
+            return Err(PayoutError::UnauthorizedCaller);
+        }
 
         require_not_paused(&env)?;
 
@@ -346,6 +380,95 @@ impl PayoutContract {
 
     pub fn is_prize_distributed(env: Env, game_id: u32) -> bool {
         env.storage().instance().has(&DataKey::PrizePayout(game_id))
+    }
+
+    /// Splits and transfers `total_amount` across `winners`.
+    ///
+    /// Remainder dust from integer division is sent to the first winner so
+    /// no funds are left stranded in the contract.
+    pub fn distribute_split_payout(
+        env: Env,
+        arena_id: u32,
+        winners: Vec<Address>,
+        total_amount: i128,
+        currency: Address,
+    ) -> Result<(), PayoutError> {
+        let admin = Self::admin(env.clone());
+        admin.require_auth();
+
+        require_not_paused(&env)?;
+
+        if total_amount <= 0 {
+            return Err(PayoutError::InvalidAmount);
+        }
+        if winners.is_empty() {
+            return Err(PayoutError::NoWinners);
+        }
+
+        let batch_key = DataKey::SplitPayoutBatch(arena_id);
+        if env.storage().instance().has(&batch_key) {
+            return Err(PayoutError::AlreadyPaid);
+        }
+
+        let winners_count = winners.len() as i128;
+        let per_winner = total_amount / winners_count;
+        let remainder = total_amount % winners_count;
+        let first_winner = winners.get(0).ok_or(PayoutError::NoWinners)?;
+
+        // Idempotency guard first (effects before interactions)
+        env.storage().instance().set(&batch_key, &true);
+
+        let token_client = token::Client::new(&env, &currency);
+        let contract_address = env.current_contract_address();
+
+        for winner in winners.iter() {
+            let amount = if winner == first_winner {
+                per_winner
+                    .checked_add(remainder)
+                    .ok_or(PayoutError::InvalidAmount)?
+            } else {
+                per_winner
+            };
+
+            token_client.transfer(&contract_address, &winner, &amount);
+
+            let receipt = SplitPayoutReceipt {
+                arena_id,
+                winner: winner.clone(),
+                amount,
+                currency: currency.clone(),
+            };
+            let receipt_key = DataKey::SplitPayout(arena_id, winner.clone());
+            env.storage().persistent().set(&receipt_key, &receipt);
+            env.storage()
+                .persistent()
+                .extend_ttl(&receipt_key, PAYOUT_TTL_THRESHOLD, PAYOUT_TTL_EXTEND_TO);
+
+            env.events()
+                .publish((TOPIC_PAYOUT_EXECUTED,), (winner, amount, currency.clone()));
+        }
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+
+        Ok(())
+    }
+
+    pub fn is_split_payout_distributed(env: Env, arena_id: u32) -> bool {
+        env.storage()
+            .instance()
+            .has(&DataKey::SplitPayoutBatch(arena_id))
+    }
+
+    pub fn get_split_payout_receipt(
+        env: Env,
+        arena_id: u32,
+        winner: Address,
+    ) -> Option<SplitPayoutReceipt> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SplitPayout(arena_id, winner))
     }
 
     // ── Emergency pause ──────────────────────────────────────────────────────

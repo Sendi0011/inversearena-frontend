@@ -1,11 +1,13 @@
 #![no_std]
 
-use soroban_sdk::{
+use soroban_sdk::{IntoVal, 
     Address, Bytes, BytesN, Env, String, Symbol, Vec, contract, contracterror, contractimpl,
     contracttype, symbol_short, token,
 };
 
 mod bounds;
+#[cfg(test)]
+mod invariants;
 
 const ADMIN_KEY: Symbol = symbol_short!("ADMIN");
 const TOKEN_KEY: Symbol = symbol_short!("TOKEN");
@@ -47,6 +49,10 @@ const TOPIC_ARENA_EXPIRED: Symbol = symbol_short!("A_EXP");
 const TOPIC_UPGRADE_PROPOSED: Symbol = symbol_short!("UP_PROP");
 const TOPIC_UPGRADE_EXECUTED: Symbol = symbol_short!("UP_EXEC");
 const TOPIC_UPGRADE_CANCELLED: Symbol = symbol_short!("UP_CANC");
+
+
+
+
 const EVENT_VERSION: u32 = 1;
 
 // ── Error codes ───────────────────────────────────────────────────────────────
@@ -100,13 +106,15 @@ pub enum ArenaError {
     DeadlineTooFar = 43,
     DeadlineNotReached = 44,
     HashMismatch = 45,
+    InvalidGracePeriod = 46,
+    NotWhitelisted = 47,
 }
 
 #[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Choice {
-    Heads,
-    Tails,
+    Heads = 0,
+    Tails = 1,
 }
 
 #[contracttype]
@@ -116,11 +124,13 @@ pub struct ArenaConfig {
     pub required_stake_amount: i128,
     pub max_rounds: u32,
     pub winner_yield_share_bps: u32,
+    pub grace_period_seconds: u64,
     pub join_deadline: u64,
     /// Platform win fee in basis points, snapshotted at arena creation.
     /// Payout uses this value rather than the current global fee so that
     /// fee changes cannot retroactively affect an in-progress game.
     pub win_fee_bps: u32,
+    pub is_private: bool,
 }
 
 #[contracttype]
@@ -279,12 +289,19 @@ macro_rules! assert_state {
     };
 }
 
+
+
+
+
 #[contracttype]
 #[derive(Clone)]
 enum DataKey {
     Config,
+    ArenaId,
+    FactoryAddress,
     Round,
     Submission(u32, Address),
+    Choices(u64, u32, Address),
     Commitment(u32, Address),
     RoundPlayers(u32),
     AllPlayers,
@@ -302,18 +319,9 @@ pub struct ArenaContract;
 
 #[contractimpl]
 impl ArenaContract {
-    pub fn initialize(env: Env, admin: Address) {
-        if env.storage().instance().has(&ADMIN_KEY) {
-            panic!("already initialized");
-        }
+    pub fn __constructor(env: Env, admin: Address) {
         admin.require_auth();
         env.storage().instance().set(&ADMIN_KEY, &admin);
-        env.storage()
-            .instance()
-            .set(&STATE_KEY, &ArenaState::Pending);
-        env.storage()
-            .instance()
-            .extend_ttl(GAME_TTL_THRESHOLD, GAME_TTL_EXTEND_TO);
     }
 
     pub fn admin(env: Env) -> Address {
@@ -379,8 +387,10 @@ impl ArenaContract {
                 required_stake_amount,
                 max_rounds: bounds::DEFAULT_MAX_ROUNDS,
                 winner_yield_share_bps: DEFAULT_WINNER_YIELD_SHARE_BPS,
+                grace_period_seconds: bounds::DEFAULT_GRACE_PERIOD_SECONDS,
                 join_deadline,
                 win_fee_bps,
+                is_private: false,
             },
         );
         env.storage().instance().set(
@@ -449,7 +459,20 @@ impl ArenaContract {
             return Err(ArenaError::AlreadyCancelled);
         }
         let config = get_config(&env)?;
-        let arena_id: u64 = 0;
+        let arena_id: u64 = env.storage().instance().get(&DataKey::ArenaId).unwrap_or(0);
+        
+        if config.is_private {
+            if let Some(factory) = env.storage().instance().get::<_, Address>(&DataKey::FactoryAddress) {
+                let is_whitelisted = env.invoke_contract::<bool>(
+                    &factory,
+                    &soroban_sdk::Symbol::new(&env, "is_whitelisted"),
+                    soroban_sdk::vec![&env, arena_id.into_val(&env), player.clone().into_val(&env)],
+                );
+                if !is_whitelisted {
+                    return Err(ArenaError::NotWhitelisted);
+                }
+            }
+        }
 
         if amount != config.required_stake_amount {
             return Err(ArenaError::InvalidAmount);
@@ -510,7 +533,7 @@ impl ArenaContract {
 
     /// Expire an unfilled arena past its join deadline. Callable by anyone.
     pub fn expire_arena(env: Env) -> Result<(), ArenaError> {
-        let current_state = get_state(&env);
+        let current_state = state(&env);
         assert_state!(current_state, ArenaState::Pending);
 
         let config = get_config(&env)?;
@@ -540,7 +563,7 @@ impl ArenaContract {
 
         env.storage().instance().set(&CANCELLED_KEY, &true);
         env.storage().instance().set(&GAME_FINISHED_KEY, &true);
-        set_state(&env, ArenaState::Cancelled);
+        env.storage().instance().set(&STATE_KEY, &ArenaState::Cancelled);
 
         env.events().publish(
             (TOPIC_ARENA_EXPIRED,),
@@ -563,63 +586,23 @@ impl ArenaContract {
         config.join_deadline
     }
 
-    pub fn set_max_rounds(env: Env, max_rounds: u32) -> Result<(), ArenaError> {
+
+
+    pub fn set_grace_period_seconds(env: Env, grace_period_seconds: u64) -> Result<(), ArenaError> {
         let admin = Self::admin(env.clone());
         admin.require_auth();
-
-        if max_rounds < bounds::MIN_MAX_ROUNDS || max_rounds > bounds::MAX_MAX_ROUNDS {
-            return Err(ArenaError::InvalidMaxRounds);
+        if grace_period_seconds > bounds::MAX_GRACE_PERIOD_SECONDS {
+            return Err(ArenaError::InvalidGracePeriod);
         }
-
         let mut config = get_config(&env)?;
-        config.max_rounds = max_rounds;
+        config.grace_period_seconds = grace_period_seconds;
         env.storage().instance().set(&DataKey::Config, &config);
         Ok(())
     }
 
-    pub fn leave(env: Env, player: Address) -> Result<i128, ArenaError> {
-        player.require_auth();
-        require_not_paused(&env)?;
-        let current_state = get_state(&env);
-        assert_state!(current_state, ArenaState::Pending);
 
-        let round = get_round(&env)?;
-        if round.round_number != 0 {
-            return Err(ArenaError::RoundAlreadyActive);
-        }
 
-        let survivor_key = DataKey::Survivor(player.clone());
-        if !env.storage().persistent().has(&survivor_key) {
-            return Err(ArenaError::NotASurvivor);
-        }
 
-        let config = get_config(&env)?;
-        let refund = config.required_stake_amount;
-        let token: Address = env.storage().instance().get(&TOKEN_KEY).ok_or(ArenaError::TokenNotSet)?;
-
-        env.storage().persistent().remove(&survivor_key);
-        let count: u32 = env.storage().instance().get(&SURVIVOR_COUNT_KEY).unwrap_or(0);
-        env.storage().instance().set(&SURVIVOR_COUNT_KEY, &count.saturating_sub(1));
-            
-        let mut all_players: Vec<Address> = env.storage().persistent().get(&DataKey::AllPlayers).unwrap_or(Vec::new(&env));
-        if let Some(i) = all_players.first_index_of(&player) {
-            all_players.remove(i);
-        }
-        env.storage().persistent().set(&DataKey::AllPlayers, &all_players);
-        bump(&env, &DataKey::AllPlayers);
-
-        // Refund the player's stake and reduce prize pool accordingly.
-        token::Client::new(&env, &token).transfer(
-            &env.current_contract_address(),
-            &player,
-            &refund,
-        );
-        let pool: i128 = env.storage().instance().get(&PRIZE_POOL_KEY).unwrap_or(0);
-        env.storage()
-            .instance()
-            .set(&PRIZE_POOL_KEY, &pool.saturating_sub(refund));
-        Ok(refund)
-    }
 
     pub fn start_round(env: Env) -> Result<RoundState, ArenaError> {
         require_not_paused(&env)?;
@@ -671,7 +654,13 @@ impl ArenaContract {
         if round.round_number != round_number {
             return Err(ArenaError::WrongRoundNumber);
         }
-        if env.ledger().sequence() > round.round_deadline_ledger {
+        let config = get_config(&env)?;
+        let grace_ledgers = grace_period_to_ledgers(config.grace_period_seconds);
+        let effective_deadline = round
+            .round_deadline_ledger
+            .checked_add(grace_ledgers)
+            .ok_or(ArenaError::RoundDeadlineOverflow)?;
+        if env.ledger().sequence() > effective_deadline {
             return Err(ArenaError::SubmissionWindowClosed);
         }
         if !env
@@ -681,7 +670,7 @@ impl ArenaContract {
         {
             return Err(ArenaError::PlayerEliminated);
         }
-        let key = DataKey::Submission(round_number, player.clone());
+        let key = DataKey::Choices(0, round_number, player.clone());
         if env.storage().persistent().has(&key) {
             return Err(ArenaError::SubmissionAlreadyExists);
         }
@@ -693,7 +682,7 @@ impl ArenaContract {
             .persistent()
             .get(&players_key)
             .unwrap_or(Vec::new(&env));
-        round_players.push_back(player);
+        round_players.push_back(player.clone());
         env.storage().persistent().set(&players_key, &round_players);
         round.total_submissions += 1;
         env.storage().instance().set(&DataKey::Round, &round);
@@ -744,10 +733,16 @@ impl ArenaContract {
     pub fn resolve_round(env: Env) -> Result<RoundState, ArenaError> {
         require_not_paused(&env)?;
         let mut round = get_round(&env)?;
+        let config = get_config(&env)?;
         if !round.active {
             return Err(ArenaError::NoActiveRound);
         }
-        if env.ledger().sequence() <= round.round_deadline_ledger {
+        let grace_ledgers = grace_period_to_ledgers(config.grace_period_seconds);
+        let resolve_after = round
+            .round_deadline_ledger
+            .checked_add(grace_ledgers)
+            .ok_or(ArenaError::RoundDeadlineOverflow)?;
+        if env.ledger().sequence() <= resolve_after {
             return Err(ArenaError::RoundStillOpen);
         }
         let players = all_players(&env);
@@ -764,7 +759,7 @@ impl ArenaContract {
             match env
                 .storage()
                 .persistent()
-                .get(&DataKey::Submission(round.round_number, player))
+                .get(&DataKey::Choices(0, round.round_number, player))
             {
                 Some(Choice::Heads) => heads += 1,
                 Some(Choice::Tails) => tails += 1,
@@ -782,7 +777,7 @@ impl ArenaContract {
             let player_choice = env
                 .storage()
                 .persistent()
-                .get(&DataKey::Submission(round.round_number, player.clone()));
+                .get(&DataKey::Choices(0, round.round_number, player.clone()));
             let survives = surviving_choice.is_none() || player_choice == surviving_choice;
             if survives {
                 survivor_count += 1;
@@ -950,7 +945,7 @@ impl ArenaContract {
     pub fn get_choice(env: Env, round_number: u32, player: Address) -> Option<Choice> {
         env.storage()
             .persistent()
-            .get(&DataKey::Submission(round_number, player))
+            .get(&DataKey::Choices(0, round_number, player))
     }
 
     pub fn get_arena_state(env: Env) -> Result<ArenaStateView, ArenaError> {
@@ -1208,13 +1203,18 @@ fn bump(env: &Env, key: &DataKey) {
         .extend_ttl(key, GAME_TTL_THRESHOLD, GAME_TTL_EXTEND_TO);
 }
 
+fn grace_period_to_ledgers(grace_period_seconds: u64) -> u32 {
+    // Approximate Stellar ledger close to 5 seconds per ledger.
+    ((grace_period_seconds + 4) / 5) as u32
+}
+
 #[cfg(test)]
 mod abi_guard;
 
 #[cfg(test)]
 mod yield_share_tests {
     use super::*;
-    use soroban_sdk::{testutils::Address as _, token::StellarAssetClient};
+    use soroban_sdk::{IntoVal, testutils::Address as _, token::StellarAssetClient};
 
     fn setup(bps: u32) -> (Env, ArenaContractClient<'static>, Address, Vec<Address>) {
         let env = Env::default();
@@ -1227,9 +1227,9 @@ mod yield_share_tests {
         let token = StellarAssetClient::new(&env, &token_id);
         let contract_id = env.register(ArenaContract, ());
         let client = ArenaContractClient::new(&env, &contract_id);
-        client.initialize(&admin);
+        
         client.set_token(&token_id);
-        client.init(&10u32, &100i128);
+        client.init(&10u32, &100i128, &0u64);
         client.set_winner_yield_share_bps(&bps);
 
         let players = Vec::from_array(
@@ -1326,7 +1326,7 @@ fn get_eliminated(env: &Env) -> Vec<Address> {
 }
 
 #[cfg(test)]
-mod abi_guard;
+
 // #[cfg(test)]
 // mod auto_advance_tests;
 // #[cfg(all(test, feature = "integration-tests"))]

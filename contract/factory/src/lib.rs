@@ -2,7 +2,11 @@
 
 use soroban_sdk::{
     Address, BytesN, Env, IntoVal, String, Symbol, Vec, contract, contracterror, contractimpl,
+<<<<<<< HEAD
     contracttype, symbol_short, xdr::ToXdr, token,
+=======
+    contracttype, symbol_short, token, xdr::ToXdr,
+>>>>>>> 83c0ce16d2eca2bfab80651a454e22f3722b0af9
 };
 
 #[cfg(test)]
@@ -19,6 +23,7 @@ const ARENA_WASM_HASH_KEY: Symbol = symbol_short!("AR_WASM");
 const POOL_COUNT_KEY: Symbol = symbol_short!("P_CNT");
 const SCHEMA_VERSION_KEY: Symbol = symbol_short!("S_VER");
 const PAUSED_KEY: Symbol = symbol_short!("PAUSED");
+const TOKEN_COUNT_KEY: Symbol = symbol_short!("TOK_CNT");
 
 // ── Fee timelock storage keys ─────────────────────────────────────────────────
 const WIN_FEE_BPS_KEY: Symbol = symbol_short!("FEE_BPS");
@@ -105,6 +110,7 @@ const TOPIC_ADMIN_CHANGED: Symbol = symbol_short!("ADM_CHG");
 const TOPIC_WASM_UPDATED: Symbol = symbol_short!("WASM_UP");
 const TOPIC_TOKEN_ADDED: Symbol = symbol_short!("TOK_ADD");
 const TOPIC_TOKEN_REMOVED: Symbol = symbol_short!("TOK_REM");
+const TOPIC_TOKEN_WL_UPDATED: Symbol = symbol_short!("TOK_WLUP");
 const TOPIC_MIN_STAKE_UPDATED: Symbol = symbol_short!("MIN_UP");
 const TOPIC_PAUSED: Symbol = symbol_short!("PAUSED");
 const TOPIC_UNPAUSED: Symbol = symbol_short!("UNPAUSED");
@@ -113,7 +119,12 @@ const TOPIC_ARENA_WL_REM: Symbol = symbol_short!("AWL_REM");
 const TOPIC_FEE_QUEUED: Symbol = symbol_short!("FEE_Q");
 const TOPIC_FEE_EXECUTED: Symbol = symbol_short!("FEE_EX");
 const TOPIC_FEE_CANCELLED: Symbol = symbol_short!("FEE_CAN");
+<<<<<<< HEAD
 const TOPIC_FEE_CONFIG_UPDATED: Symbol = symbol_short!("CRF_UP");
+=======
+const TOPIC_ARENA_WL_ADD: Symbol = symbol_short!("AWL_ADD");
+const TOPIC_ARENA_WL_REM: Symbol = symbol_short!("AWL_REM");
+>>>>>>> 83c0ce16d2eca2bfab80651a454e22f3722b0af9
 
 /// Event payload version. Include in every event data tuple so consumers
 /// can detect schema changes without re-deploying indexers.
@@ -171,10 +182,20 @@ pub enum Error {
     NoPendingFeeUpdate = 20,
     /// Provided fee exceeds `MAX_WIN_FEE_BPS` (2000).
     FeeTooHigh = 21,
+<<<<<<< HEAD
     /// Creation fee amount is negative.
     InvalidCreationFee = 22,
     /// Host does not hold enough `fee_token` to pay the configured creation fee.
     InsufficientCreationFee = 23,
+=======
+    /// Token is not currently on the allowed whitelist.
+    TokenNotAllowed = 22,
+    /// Removing the token would leave whitelist empty.
+    EmptyTokenWhitelist = 23,
+    /// Token address does not expose the expected SAC interface.
+    InvalidTokenContract = 24,
+
+>>>>>>> 83c0ce16d2eca2bfab80651a454e22f3722b0af9
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -196,13 +217,8 @@ impl FactoryContract {
     ///
     /// # Authorization
     /// Requires auth from the admin address to prevent front-running.
-    pub fn initialize(env: Env, admin: Address) -> Result<(), Error> {
-        if env.storage().instance().has(&ADMIN_KEY) {
-            return Err(Error::AlreadyInitialized);
-        }
-
+    pub fn __constructor(env: Env, admin: Address) -> Result<(), Error> {
         admin.require_auth();
-
         env.storage().instance().set(&ADMIN_KEY, &admin);
         env.storage()
             .instance()
@@ -224,6 +240,7 @@ impl FactoryContract {
         env.storage()
             .instance()
             .set(&SCHEMA_VERSION_KEY, &CURRENT_SCHEMA_VERSION);
+        env.storage().instance().set(&TOKEN_COUNT_KEY, &0u32);
         Ok(())
     }
 
@@ -571,7 +588,7 @@ impl FactoryContract {
         // This must be checked before deploying any contract to prevent pools
         // backed by malicious or worthless tokens from ever being created.
         if !Self::is_token_supported(env.clone(), currency.clone()) {
-            return Err(Error::UnsupportedToken);
+            return Err(Error::TokenNotAllowed);
         }
 
         if capacity < 2 || capacity > MAX_POOL_CAPACITY {
@@ -635,6 +652,11 @@ impl FactoryContract {
         let salt = env.crypto().sha256(&salt_bin);
 
         // Deploy the contract.
+        #[cfg(not(test))]
+        let arena_address = env.deployer()
+            .with_current_contract(salt)
+            .deploy_v2(wasm_hash, (env.current_contract_address(),));
+
         #[cfg(test)]
         let arena_address = {
             let _ = wasm_hash; // consumed via WasmHashNotSet check above; not used in test path
@@ -642,29 +664,22 @@ impl FactoryContract {
                 .deployer()
                 .with_current_contract(salt)
                 .deployed_address();
-            env.register_at(&addr, ArenaContract, ());
+            env.register_at(&addr, ArenaContract, (env.current_contract_address(),));
             addr
         };
 
+<<<<<<< HEAD
         #[cfg(not(test))]
         let arena_address = env
             .deployer()
             .with_current_contract(salt)
             .deploy_v2(wasm_hash, ());
 
+=======
+>>>>>>> 83c0ce16d2eca2bfab80651a454e22f3722b0af9
         // ── Initialisation ──────────────────────────────────────────────────────
-
-        // 1. Call initialize so that the factory becomes the admin.
-        env.invoke_contract::<()>(
-            &arena_address,
-            &soroban_sdk::Symbol::new(&env, "initialize"),
-            soroban_sdk::vec![&env, env.current_contract_address().into_val(&env)],
-        );
-
-        // Use a generic client to call init and initialize.
-        // Note: In a real implementation, you'd use the generated client from the arena contract.
-        // For simplicity here, we use invoke_contract if we don't have the client imported.
-        // However, better to assume the workspace allows cross-contract calls.
+        // Note: __constructor runs at deploy time (deploy_v2/register_at), so
+        // there is no separate initialize() call needed here.
 
         let fee_snapshot = Self::current_fee_bps(env.clone());
         env.invoke_contract::<()>(
@@ -878,11 +893,27 @@ impl FactoryContract {
         let admin = require_admin(&env)?;
         require_not_paused(&env)?;
         admin.require_auth();
+
+        // Probe SAC interface so non-token contracts cannot be whitelisted.
+        // A valid SAC exposes `decimals()`.
+        let decimals = token::Client::new(&env, &token).decimals();
+        if decimals > 18 {
+            return Err(Error::InvalidTokenContract);
+        }
+
+        let key = DataKey::SupportedToken(token.clone());
+        let existed = env.storage().instance().has(&key);
         env.storage()
             .instance()
-            .set(&DataKey::SupportedToken(token.clone()), &true);
+            .set(&key, &true);
+        if !existed {
+            let count: u32 = env.storage().instance().get(&TOKEN_COUNT_KEY).unwrap_or(0);
+            env.storage().instance().set(&TOKEN_COUNT_KEY, &(count + 1));
+        }
         env.events()
             .publish((TOPIC_TOKEN_ADDED,), (EVENT_VERSION, false, true, token));
+        env.events()
+            .publish((TOPIC_TOKEN_WL_UPDATED,), (EVENT_VERSION, true));
         Ok(())
     }
 
@@ -894,11 +925,42 @@ impl FactoryContract {
         let admin = require_admin(&env)?;
         require_not_paused(&env)?;
         admin.require_auth();
+
+        let key = DataKey::SupportedToken(token.clone());
+        let existed = env.storage().instance().has(&key);
+        if existed {
+            let count: u32 = env.storage().instance().get(&TOKEN_COUNT_KEY).unwrap_or(0);
+            if count <= 1 {
+                return Err(Error::EmptyTokenWhitelist);
+            }
+            env.storage().instance().set(&TOKEN_COUNT_KEY, &(count - 1));
+        }
         env.storage()
             .instance()
-            .remove(&DataKey::SupportedToken(token.clone()));
+            .remove(&key);
         env.events()
             .publish((TOPIC_TOKEN_REMOVED,), (EVENT_VERSION, token));
+        env.events()
+            .publish((TOPIC_TOKEN_WL_UPDATED,), (EVENT_VERSION, false));
+        Ok(())
+    }
+
+    pub fn update_allowed_tokens(
+        env: Env,
+        add_tokens: Vec<Address>,
+        remove_tokens: Vec<Address>,
+    ) -> Result<(), Error> {
+        let admin = require_admin(&env)?;
+        require_not_paused(&env)?;
+        admin.require_auth();
+
+        for token in add_tokens.iter() {
+            Self::add_supported_token(env.clone(), token)?;
+        }
+        for token in remove_tokens.iter() {
+            Self::remove_supported_token(env.clone(), token)?;
+        }
+
         Ok(())
     }
 
