@@ -52,10 +52,13 @@
     "HashMismatch": 45,
     "InvalidGracePeriod": 46,
     "NotWhitelisted": 47,
-    "Unauthorized": 48,
-    "NoPendingAdminTransfer": 49,
-    "AdminTransferExpired": 50,
-    "VaultNotSet": 51
+    "BatchAlreadyInProgress": 48,
+    "NoBatchInProgress": 49,
+    "BatchNotComplete": 50,
+    "Unauthorized": 51,
+    "NoPendingAdminTransfer": 52,
+    "AdminTransferExpired": 53,
+    "VaultNotSet": 54
   },
   "event_topics": [
     "UP_PROP",

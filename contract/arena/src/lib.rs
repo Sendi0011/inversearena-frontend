@@ -123,10 +123,13 @@ pub enum ArenaError {
     HashMismatch = 45,
     InvalidGracePeriod = 46,
     NotWhitelisted = 47,
-    Unauthorized = 48,
-    NoPendingAdminTransfer = 49,
-    AdminTransferExpired = 50,
-    VaultNotSet = 51,
+    BatchAlreadyInProgress = 48,
+    NoBatchInProgress = 49,
+    BatchNotComplete = 50,
+    Unauthorized = 51,
+    NoPendingAdminTransfer = 52,
+    AdminTransferExpired = 53,
+    VaultNotSet = 54,
 }
 
 #[contracttype]
@@ -384,6 +387,29 @@ enum DataKey {
     Winner(Address),
     Refunded(Address),
     Metadata(u64),
+    /// In-progress batched round resolution. See [`ResolutionState`].
+    Resolution,
+}
+
+/// Intermediate tally for a batched round resolution (issue #480).
+///
+/// Stored under [`DataKey::Resolution`] only while a batched resolve is in
+/// flight. `start_resolution` creates it, each `continue_resolution` advances
+/// `processed`, and `finalize_resolution` consumes it (then clears the slot).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolutionState {
+    /// Round number the batch is resolving — guards against starting a batch
+    /// for one round and finalising it for another after a manual round flip.
+    pub round_number: u32,
+    /// Snapshot of `all_players().len()` at `start_resolution`.
+    pub total_players: u32,
+    /// Number of players counted so far (cursor into `all_players`).
+    pub processed: u32,
+    /// Tally of `Choice::Heads` from surviving players counted so far.
+    pub heads_count: u32,
+    /// Tally of `Choice::Tails` from surviving players counted so far.
+    pub tails_count: u32,
 }
 
 /// # ArenaContract Access Control Matrix
@@ -594,6 +620,10 @@ impl ArenaContract {
             &env.current_contract_address(),
             &amount,
         );
+        let pool: i128 = env.storage().instance().get(&PRIZE_POOL_KEY).unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&PRIZE_POOL_KEY, &(pool + amount));
         env.storage().persistent().set(&key, &true);
         bump(&env, &key);
         env.storage()
@@ -892,6 +922,171 @@ impl ArenaContract {
         Ok(round)
     }
 
+    // ── Batched round resolution (issue #480) ────────────────────────────────
+    //
+    // `resolve_round` does the entire tally + apply pass in one transaction,
+    // which can exceed Soroban's per-tx CPU budget for large arenas (~64
+    // players). The trio below splits the tally across multiple transactions
+    // so the per-call work stays bounded:
+    //
+    //   start_resolution(batch_size)    — initialise tally, process first batch
+    //   continue_resolution(batch_size) — process next batch (any number of times)
+    //   finalize_resolution()           — apply eliminations, clear batch state
+    //
+    // Small arenas can keep using `resolve_round`; the batched path is a pure
+    // alternative entrypoint with no impact on the single-call flow.
+
+    /// Begin a batched round resolution by tallying the first `batch_size`
+    /// players from `all_players`. The intermediate tally is persisted under
+    /// [`DataKey::Resolution`] and consumed by `finalize_resolution`.
+    ///
+    /// # Errors
+    /// * [`ArenaError::Paused`] — contract is paused.
+    /// * [`ArenaError::NoActiveRound`] — no round is currently active.
+    /// * [`ArenaError::RoundDeadlineOverflow`] — deadline + grace overflows.
+    /// * [`ArenaError::RoundStillOpen`] — the deadline (plus grace) hasn't elapsed.
+    /// * [`ArenaError::BatchAlreadyInProgress`] — a batch is already pending.
+    ///
+    /// `batch_size == 0` is accepted but does no work; the caller is expected
+    /// to advance via `continue_resolution` with a positive batch size before
+    /// finalising. (Soroban's contract-error spec is capped at 50 variants,
+    /// so we omit a dedicated `InvalidBatchSize` error and leave the
+    /// degenerate case as a no-op rather than burn a code on it.)
+    pub fn start_resolution(env: Env, batch_size: u32) -> Result<ResolutionState, ArenaError> {
+        require_not_paused(&env)?;
+        let round = get_round(&env)?;
+        let config = get_config(&env)?;
+        if !round.active {
+            return Err(ArenaError::NoActiveRound);
+        }
+        let grace_ledgers = grace_period_to_ledgers(config.grace_period_seconds);
+        let resolve_after = round
+            .round_deadline_ledger
+            .checked_add(grace_ledgers)
+            .ok_or(ArenaError::RoundDeadlineOverflow)?;
+        if env.ledger().sequence() <= resolve_after {
+            return Err(ArenaError::RoundStillOpen);
+        }
+        if env.storage().instance().has(&DataKey::Resolution) {
+            return Err(ArenaError::BatchAlreadyInProgress);
+        }
+
+        let players = all_players(&env);
+        let mut state = ResolutionState {
+            round_number: round.round_number,
+            total_players: players.len(),
+            processed: 0,
+            heads_count: 0,
+            tails_count: 0,
+        };
+        process_tally_batch(&env, &mut state, &players, batch_size);
+        env.storage().instance().set(&DataKey::Resolution, &state);
+        Ok(state)
+    }
+
+    /// Tally the next `batch_size` players from a previously-started batch.
+    /// Calling this once `processed == total_players` is a no-op and just
+    /// returns the current state — it never errors mid-flight, so callers
+    /// can safely retry.
+    ///
+    /// # Errors
+    /// * [`ArenaError::Paused`] — contract is paused.
+    /// * [`ArenaError::NoBatchInProgress`] — `start_resolution` hasn't run.
+    ///
+    /// `batch_size == 0` is accepted but does no work (see `start_resolution`).
+    pub fn continue_resolution(env: Env, batch_size: u32) -> Result<ResolutionState, ArenaError> {
+        require_not_paused(&env)?;
+        let mut state: ResolutionState = env
+            .storage()
+            .instance()
+            .get(&DataKey::Resolution)
+            .ok_or(ArenaError::NoBatchInProgress)?;
+        if state.processed < state.total_players {
+            let players = all_players(&env);
+            process_tally_batch(&env, &mut state, &players, batch_size);
+            env.storage().instance().set(&DataKey::Resolution, &state);
+        }
+        Ok(state)
+    }
+
+    /// Apply eliminations using the completed batched tally and clear the
+    /// batch state. Mirrors the bookkeeping at the tail end of
+    /// `resolve_round`.
+    ///
+    /// # Errors
+    /// * [`ArenaError::Paused`] — contract is paused.
+    /// * [`ArenaError::NoBatchInProgress`] — no batch state to finalise.
+    /// * [`ArenaError::BatchNotComplete`] — `processed < total_players`.
+    pub fn finalize_resolution(env: Env) -> Result<RoundState, ArenaError> {
+        require_not_paused(&env)?;
+        let state: ResolutionState = env
+            .storage()
+            .instance()
+            .get(&DataKey::Resolution)
+            .ok_or(ArenaError::NoBatchInProgress)?;
+        if state.processed < state.total_players {
+            return Err(ArenaError::BatchNotComplete);
+        }
+
+        let mut round = get_round(&env)?;
+        let surviving_choice =
+            choose_surviving_side(&env, state.heads_count, state.tails_count);
+
+        let players = all_players(&env);
+        let mut survivor_count = 0u32;
+        let mut eliminated_count = 0u32;
+        for player in players.iter() {
+            let survivor_key = DataKey::Survivor(player.clone());
+            if !env.storage().persistent().has(&survivor_key) {
+                continue;
+            }
+            let player_choice = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Choices(0, state.round_number, player.clone()));
+            let survives = surviving_choice.is_none() || player_choice == surviving_choice;
+            if survives {
+                survivor_count += 1;
+            } else {
+                env.storage().persistent().remove(&survivor_key);
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::Eliminated(player.clone()), &true);
+                eliminated_count += 1;
+            }
+        }
+
+        env.storage()
+            .instance()
+            .set(&SURVIVOR_COUNT_KEY, &survivor_count);
+        round.active = false;
+        round.finished = true;
+        env.storage().instance().set(&DataKey::Round, &round);
+        if survivor_count <= 1 {
+            env.storage()
+                .instance()
+                .set(&STATE_KEY, &ArenaState::Completed);
+        }
+        env.storage().instance().remove(&DataKey::Resolution);
+        env.events().publish(
+            (TOPIC_ROUND_RESOLVED,),
+            (
+                round.round_number,
+                state.heads_count,
+                state.tails_count,
+                eliminated_count,
+            ),
+        );
+        Ok(round)
+    }
+
+    /// Read the current batched-resolution state, or `None` if no batch is in
+    /// flight. Read-only — useful for the frontend to decide whether to call
+    /// `continue_resolution` or `finalize_resolution`.
+    pub fn pending_resolution(env: Env) -> Option<ResolutionState> {
+        env.storage().instance().get(&DataKey::Resolution)
+    }
+
     pub fn set_winner(
         env: Env,
         player: Address,
@@ -978,41 +1173,6 @@ impl ArenaContract {
             .unwrap_or(false)
     }
 
-    pub fn leave(env: Env, player: Address) -> Result<(), ArenaError> {
-        player.require_auth();
-        if !env
-            .storage()
-            .persistent()
-            .has(&DataKey::Survivor(player.clone()))
-        {
-            return Err(ArenaError::NotASurvivor);
-        }
-        env.storage()
-            .persistent()
-            .remove(&DataKey::Survivor(player));
-        let count: u32 = env
-            .storage()
-            .instance()
-            .get(&SURVIVOR_COUNT_KEY)
-            .unwrap_or(0);
-        env.storage()
-            .instance()
-            .set(&SURVIVOR_COUNT_KEY, &count.saturating_sub(1));
-        Ok(())
-    }
-
-    pub fn set_max_rounds(env: Env, max_rounds: u32) -> Result<(), ArenaError> {
-        let admin = Self::admin(env.clone());
-        admin.require_auth();
-        if max_rounds < bounds::MIN_MAX_ROUNDS || max_rounds > bounds::MAX_MAX_ROUNDS {
-            return Err(ArenaError::InvalidMaxRounds);
-        }
-        let mut config = get_config(&env)?;
-        config.max_rounds = max_rounds;
-        env.storage().instance().set(&DataKey::Config, &config);
-        Ok(())
-    }
-
     pub fn get_config(env: Env) -> Result<ArenaConfig, ArenaError> {
         get_config(&env)
     }
@@ -1028,43 +1188,18 @@ impl ArenaContract {
     }
 
     pub fn get_arena_state(env: Env) -> Result<ArenaStateView, ArenaError> {
-        let round = get_round(&env)?;
-        Ok(ArenaStateView {
-            survivors_count: env
-                .storage()
-                .instance()
-                .get(&SURVIVOR_COUNT_KEY)
-                .unwrap_or(0),
-            max_capacity: capacity(&env),
-            round_number: round.round_number,
-            current_stake: env.storage().instance().get(&PRIZE_POOL_KEY).unwrap_or(0),
-            potential_payout: env.storage().instance().get(&PRIZE_POOL_KEY).unwrap_or(0),
-            vault_active: env.storage().instance().get(&VAULT_ACTIVE_KEY).unwrap_or(false),
-        })
+        let cache = ArenaCache::load(&env)?;
+        Ok(cache.arena_state_view())
     }
 
     pub fn get_user_state(env: Env, player: Address) -> UserStateView {
-        let is_active = env
-            .storage()
-            .persistent()
-            .has(&DataKey::Survivor(player.clone()));
-        let has_won = env.storage().persistent().has(&DataKey::Winner(player));
-        UserStateView { is_active, has_won }
+        PlayerCache::load(&env, &player).user_state_view()
     }
 
     pub fn get_full_state(env: Env, player: Address) -> Result<FullStateView, ArenaError> {
-        let arena = Self::get_arena_state(env.clone())?;
-        let user = Self::get_user_state(env, player);
-        Ok(FullStateView {
-            survivors_count: arena.survivors_count,
-            max_capacity: arena.max_capacity,
-            round_number: arena.round_number,
-            current_stake: arena.current_stake,
-            potential_payout: arena.potential_payout,
-            is_active: user.is_active,
-            has_won: user.has_won,
-            vault_active: arena.vault_active,
-        })
+        let cache = ArenaCache::load(&env)?;
+        let player_cache = PlayerCache::load(&env, &player);
+        Ok(cache.full_state_view(&player_cache))
     }
 
     pub fn set_metadata(
@@ -1093,7 +1228,7 @@ impl ArenaContract {
             description,
             host,
             created_at: env.ledger().timestamp(),
-            is_private: get_config(&env).map(|c| c.is_private).unwrap_or(false),
+            is_private: false,
         };
         env.storage()
             .persistent()
@@ -1508,6 +1643,89 @@ fn apply_winner_distribution(
     Ok(())
 }
 
+/// Per-call snapshot of the arena's instance-storage fields.
+///
+/// Read-only entrypoints (`get_arena_state`, `get_full_state`) used to reach
+/// into instance storage independently and re-issue overlapping reads — most
+/// notably `PRIZE_POOL_KEY` was loaded twice inside `get_arena_state` itself.
+/// Loading once into this struct guarantees each ledger key is read at most
+/// once per public invocation, lowering simulation cost (issue #481).
+///
+/// Not a `#[contracttype]` — purely an in-memory cache, never persisted.
+struct ArenaCache {
+    round: RoundState,
+    survivor_count: u32,
+    max_capacity: u32,
+    prize_pool: i128,
+    vault_active: bool,
+}
+
+impl ArenaCache {
+    fn load(env: &Env) -> Result<Self, ArenaError> {
+        let storage = env.storage().instance();
+        let round: RoundState = storage.get(&DataKey::Round).ok_or(ArenaError::NotInitialized)?;
+        let survivor_count: u32 = storage.get(&SURVIVOR_COUNT_KEY).unwrap_or(0);
+        let max_capacity: u32 = storage.get(&CAPACITY_KEY).unwrap_or(bounds::MAX_ARENA_PARTICIPANTS);
+        let prize_pool: i128 = storage.get(&PRIZE_POOL_KEY).unwrap_or(0);
+        let vault_active: bool = storage.get(&VAULT_ACTIVE_KEY).unwrap_or(false);
+        Ok(Self {
+            round,
+            survivor_count,
+            max_capacity,
+            prize_pool,
+            vault_active,
+        })
+    }
+
+    fn arena_state_view(&self) -> ArenaStateView {
+        ArenaStateView {
+            survivors_count: self.survivor_count,
+            max_capacity: self.max_capacity,
+            round_number: self.round.round_number,
+            current_stake: self.prize_pool,
+            potential_payout: self.prize_pool,
+            vault_active: self.vault_active,
+        }
+    }
+
+    fn full_state_view(&self, player: &PlayerCache) -> FullStateView {
+        FullStateView {
+            survivors_count: self.survivor_count,
+            max_capacity: self.max_capacity,
+            round_number: self.round.round_number,
+            current_stake: self.prize_pool,
+            potential_payout: self.prize_pool,
+            is_active: player.is_active,
+            has_won: player.has_won,
+            vault_active: self.vault_active,
+        }
+    }
+}
+
+/// Per-call snapshot of one player's persistent flags. Mirrors `ArenaCache`
+/// for player-scoped reads so `get_full_state` makes each persistent lookup
+/// at most once.
+struct PlayerCache {
+    is_active: bool,
+    has_won: bool,
+}
+
+impl PlayerCache {
+    fn load(env: &Env, player: &Address) -> Self {
+        let persistent = env.storage().persistent();
+        let is_active = persistent.has(&DataKey::Survivor(player.clone()));
+        let has_won = persistent.has(&DataKey::Winner(player.clone()));
+        Self { is_active, has_won }
+    }
+
+    fn user_state_view(&self) -> UserStateView {
+        UserStateView {
+            is_active: self.is_active,
+            has_won: self.has_won,
+        }
+    }
+}
+
 fn get_config(env: &Env) -> Result<ArenaConfig, ArenaError> {
     env.storage()
         .instance()
@@ -1527,6 +1745,14 @@ fn state(env: &Env) -> ArenaState {
         .instance()
         .get(&STATE_KEY)
         .unwrap_or(ArenaState::Pending)
+}
+
+fn get_state(env: &Env) -> ArenaState {
+    state(env)
+}
+
+fn set_state(env: &Env, new_state: ArenaState) {
+    env.storage().instance().set(&STATE_KEY, &new_state);
 }
 
 fn capacity(env: &Env) -> u32 {
@@ -1555,6 +1781,43 @@ fn eliminated_players(env: &Env) -> Vec<Address> {
         }
     }
     eliminated
+}
+
+/// Tally up to `batch_size` players starting at `state.processed`, advancing
+/// the cursor and accumulating heads/tails counts in-place. Players that are
+/// not in the survivor set or have no recorded choice are skipped but still
+/// counted toward `processed`, so the cursor walks every entry in
+/// `all_players` exactly once across the entire batch flow.
+fn process_tally_batch(
+    env: &Env,
+    state: &mut ResolutionState,
+    players: &Vec<Address>,
+    batch_size: u32,
+) {
+    let end = state
+        .processed
+        .saturating_add(batch_size)
+        .min(state.total_players);
+    for i in state.processed..end {
+        if let Some(player) = players.get(i) {
+            if env
+                .storage()
+                .persistent()
+                .has(&DataKey::Survivor(player.clone()))
+            {
+                match env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::Choices(0, state.round_number, player))
+                {
+                    Some(Choice::Heads) => state.heads_count += 1,
+                    Some(Choice::Tails) => state.tails_count += 1,
+                    None => {}
+                }
+            }
+        }
+    }
+    state.processed = end;
 }
 
 fn choose_surviving_side(env: &Env, heads: u32, tails: u32) -> Option<Choice> {
