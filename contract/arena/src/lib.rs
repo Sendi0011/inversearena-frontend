@@ -505,6 +505,10 @@ impl ArenaContract {
             &env.current_contract_address(),
             &amount,
         );
+        let pool: i128 = env.storage().instance().get(&PRIZE_POOL_KEY).unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&PRIZE_POOL_KEY, &(pool + amount));
         env.storage().persistent().set(&key, &true);
         bump(&env, &key);
         env.storage()
@@ -930,41 +934,6 @@ impl ArenaContract {
             .unwrap_or(false)
     }
 
-    pub fn leave(env: Env, player: Address) -> Result<(), ArenaError> {
-        player.require_auth();
-        if !env
-            .storage()
-            .persistent()
-            .has(&DataKey::Survivor(player.clone()))
-        {
-            return Err(ArenaError::NotASurvivor);
-        }
-        env.storage()
-            .persistent()
-            .remove(&DataKey::Survivor(player));
-        let count: u32 = env
-            .storage()
-            .instance()
-            .get(&SURVIVOR_COUNT_KEY)
-            .unwrap_or(0);
-        env.storage()
-            .instance()
-            .set(&SURVIVOR_COUNT_KEY, &count.saturating_sub(1));
-        Ok(())
-    }
-
-    pub fn set_max_rounds(env: Env, max_rounds: u32) -> Result<(), ArenaError> {
-        let admin = Self::admin(env.clone());
-        admin.require_auth();
-        if max_rounds < bounds::MIN_MAX_ROUNDS || max_rounds > bounds::MAX_MAX_ROUNDS {
-            return Err(ArenaError::InvalidMaxRounds);
-        }
-        let mut config = get_config(&env)?;
-        config.max_rounds = max_rounds;
-        env.storage().instance().set(&DataKey::Config, &config);
-        Ok(())
-    }
-
     pub fn get_config(env: Env) -> Result<ArenaConfig, ArenaError> {
         get_config(&env)
     }
@@ -1043,7 +1012,7 @@ impl ArenaContract {
             description,
             host,
             created_at: env.ledger().timestamp(),
-            is_private: get_config(&env).map(|c| c.is_private).unwrap_or(false),
+            is_private: false,
         };
         env.storage()
             .persistent()
@@ -1166,6 +1135,14 @@ fn state(env: &Env) -> ArenaState {
         .instance()
         .get(&STATE_KEY)
         .unwrap_or(ArenaState::Pending)
+}
+
+fn get_state(env: &Env) -> ArenaState {
+    state(env)
+}
+
+fn set_state(env: &Env, new_state: ArenaState) {
+    env.storage().instance().set(&STATE_KEY, &new_state);
 }
 
 fn capacity(env: &Env) -> u32 {
