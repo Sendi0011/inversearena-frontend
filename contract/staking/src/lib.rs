@@ -387,6 +387,10 @@ impl StakingContract {
     }
 
     /// Lock host stake for an arena so host cannot withdraw below reserved amount.
+    ///
+    /// # Authorization
+    /// `caller` must be either the contract admin or the configured factory address.
+    /// Any other caller is rejected with [`StakingError::Unauthorized`].
     pub fn lock_host_stake(
         env: Env,
         caller: Address,
