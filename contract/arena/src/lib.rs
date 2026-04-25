@@ -585,6 +585,7 @@ impl ArenaContract {
     pub fn set_token(env: Env, token: Address) -> Result<(), ArenaError> {
         let admin = Self::admin(env.clone());
         admin.require_auth();
+        require_not_paused(&env)?;
         let survivors_count: u32 = env
             .storage()
             .instance()
@@ -600,6 +601,7 @@ impl ArenaContract {
     pub fn set_capacity(env: Env, capacity: u32) -> Result<(), ArenaError> {
         let admin = Self::admin(env.clone());
         admin.require_auth();
+        require_not_paused(&env)?;
         if !(bounds::MIN_ARENA_PARTICIPANTS..=bounds::MAX_ARENA_PARTICIPANTS).contains(&capacity) {
             return Err(ArenaError::InvalidCapacity);
         }
@@ -610,6 +612,7 @@ impl ArenaContract {
     pub fn set_winner_yield_share_bps(env: Env, bps: u32) -> Result<(), ArenaError> {
         let admin = Self::admin(env.clone());
         admin.require_auth();
+        require_not_paused(&env)?;
         if bps > 10_000 {
             return Err(ArenaError::InvalidAmount);
         }
@@ -759,6 +762,7 @@ impl ArenaContract {
 
     /// Expire an unfilled arena past its join deadline. Callable by anyone.
     pub fn expire_arena(env: Env) -> Result<(), ArenaError> {
+        require_not_paused(&env)?;
         let current_state = state(&env);
         match current_state {
             ArenaState::Pending => {}
@@ -838,6 +842,7 @@ impl ArenaContract {
     pub fn set_grace_period_seconds(env: Env, grace_period_seconds: u64) -> Result<(), ArenaError> {
         let admin = Self::admin(env.clone());
         admin.require_auth();
+        require_not_paused(&env)?;
         if grace_period_seconds > bounds::MAX_GRACE_PERIOD_SECONDS {
             return Err(ArenaError::InvalidGracePeriod);
         }
@@ -967,6 +972,7 @@ impl ArenaContract {
         commitment: BytesN<32>,
     ) -> Result<(), ArenaError> {
         player.require_auth();
+        require_not_paused(&env)?;
         let key = DataKey::Commitment(round_number, player);
         if env.storage().persistent().has(&key) {
             return Err(ArenaError::AlreadyCommitted);
@@ -1341,6 +1347,43 @@ impl ArenaContract {
             .unwrap_or(false)
     }
 
+    pub fn leave(env: Env, player: Address) -> Result<(), ArenaError> {
+        player.require_auth();
+        require_not_paused(&env)?;
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::Survivor(player.clone()))
+        {
+            return Err(ArenaError::NotASurvivor);
+        }
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Survivor(player));
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&SURVIVOR_COUNT_KEY)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&SURVIVOR_COUNT_KEY, &count.saturating_sub(1));
+        Ok(())
+    }
+
+    pub fn set_max_rounds(env: Env, max_rounds: u32) -> Result<(), ArenaError> {
+        let admin = Self::admin(env.clone());
+        admin.require_auth();
+        require_not_paused(&env)?;
+        if max_rounds < bounds::MIN_MAX_ROUNDS || max_rounds > bounds::MAX_MAX_ROUNDS {
+            return Err(ArenaError::InvalidMaxRounds);
+        }
+        let mut config = get_config(&env)?;
+        config.max_rounds = max_rounds;
+        env.storage().instance().set(&DataKey::Config, &config);
+        Ok(())
+    }
+
     pub fn get_config(env: Env) -> Result<ArenaConfig, ArenaError> {
         get_config(&env)
     }
@@ -1489,6 +1532,10 @@ impl ArenaContract {
         env.storage()
             .instance()
             .set(&EXECUTE_AFTER_KEY, &execute_after);
+        env.events().publish(
+            (TOPIC_UPGRADE_PROPOSED,),
+            (EVENT_VERSION, new_wasm_hash.clone(), execute_after),
+        );
         Ok(())
     }
 
@@ -1533,6 +1580,7 @@ impl ArenaContract {
         }
         env.storage().instance().remove(&PENDING_HASH_KEY);
         env.storage().instance().remove(&EXECUTE_AFTER_KEY);
+        env.events().publish((TOPIC_UPGRADE_CANCELLED,), (EVENT_VERSION,));
         Ok(())
     }
 
